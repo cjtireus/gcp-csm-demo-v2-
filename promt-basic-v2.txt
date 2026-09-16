@@ -1,0 +1,45 @@
+Act as a Google Cloud Solutions Architect. Your goal is to generate a complete bash script named csm-demo-v2-script-basic.sh and the necessary Kubernetes manifests to deploy an end-to-end strict "Edge-to-Mesh mTLS" architecture on GKE Autopilot using Google Cloud Service Mesh (managed control plane) and the Kubernetes Gateway API.
+
+ARCHITECTURE (end goal):
+- PUBLIC EDGE: An external Angular/browser client connects over public HTTPS (TLS 1.3 + OIDC JWT auth) to an External GKE Gateway (Envoy-based, gatewayClassName 'gke-l7-global-external-managed') with Cloud CDN enabled and Cloud Armor WAF attached. The Gateway terminates public TLS.
+- EDGE-TO-MESH: The Gateway re-encrypts traffic and connects to backend mesh pods using mTLS (validated against the Mesh CA root).
+- SERVICE MESH WORKLOADS: Application pods run in the mesh namespace (labeled istio-injection=enabled) with Cloud Service Mesh auto-injecting Envoy sidecars. Intra-mesh traffic uses strict mTLS with short-lived SPIFFE certificates issued by the Mesh CA via GKE Workload Identity.
+- CONTROL PLANE: Cloud Service Mesh managed control plane provides the xDS API, Workload Identity / Mesh CA, and sidecar lifecycle management.
+- WORKLOADS: A Node.js / GraphQL pod (with Envoy sidecar) and a gRPC backend service pool. NOTE: proxyless gRPC for the backend is DEFERRED (~6 months) — for this demo the gRPC backend also runs with an Envoy sidecar.
+
+CRITICAL CONSTRAINTS:
+1. USE KUBERNETES GATEWAY API FOR ROUTING: Use Gateway API resources for all routing. For east-west mesh routing (GAMMA), anchor HTTPRoute/GRPCRoute parentRefs to the target Service (kind: Service, group: ""), NOT to a Gateway. For north-south edge ingress, use a Gateway (gke-l7-global-external-managed) plus GKE Gateway policy CRDs (GCPBackendPolicy, GCPGatewayPolicy, HealthCheckPolicy). Do not use the Istio VirtualService or DestinationRule CRDs for routing.
+2. ENVOY SIDECAR INJECTION: Enable Google Cloud Service Mesh automatic Envoy sidecar injection by labeling the namespace istio-injection=enabled. For gRPC Services, add the annotation networking.gke.io/app-protocols: '{"<port>":"HTTP2"}'.
+3. STRICT mTLS: Enforce strict mTLS using a PeerAuthentication resource (apiVersion security.istio.io/v1beta1) with spec.mtls.mode STRICT — namespace-scoped in the mesh namespace, or mesh-wide with no selector in the istio-system root namespace. This is the required mechanism in Cloud Service Mesh; PeerAuthentication is the one Istio CRD permitted. Certificates are issued by the Mesh CA (SPIFFE) via GKE Workload Identity.
+4. IDENTITY: Use native GKE Workload Identity (Project-level principal) with Mesh CA-issued certificates.
+5. Use Namespace name 'csm-demo-v2-basic' labeled istio-injection=enabled.
+
+STEP-BY-STEP TASKS:
+1. Enable APIs: cloudresourcemanager, compute, container, gkehub, mesh.googleapis.com, meshconfig, trafficdirector, networkservices, networksecurity.
+2. Service Identities & IAM Setup:
+    - Create Service Identities for `meshconfig`, `trafficdirector`, `networkservices`, and `networksecurity` using `gcloud beta services identity create`.
+    - Grant `roles/compute.securityAdmin` and `roles/compute.networkAdmin` to the GKE Service Agent.
+    - Grant `roles/anthosservicemesh.serviceAgent`, `roles/meshcontrolplane.serviceAgent`, and `roles/compute.securityAdmin` to the Cloud Service Mesh Service Agent.
+    - Grant `roles/trafficdirector.client` to workloads in the mesh.
+3. Create VPC and Subnet in europe-north2. Reserve a global static external IP for the edge Gateway.
+4. Provision GKE Autopilot cluster 'csm-autopilot-cluster' with --enable-mesh-certificates and --gateway-api=standard.
+5. Mesh Config: Register the cluster to the Fleet, run 'gcloud container fleet mesh enable', then 'gcloud alpha container fleet mesh update --config-api gateway'. This enables the managed Cloud Service Mesh control plane WITH the managed Envoy data plane (sidecar injection). IMPORTANT: '--config-api' and '--management' are mutually exclusive — do NOT also pass '--management automatic' (it selects the Istio config API and permanently locks the cluster out of the Gateway API). Then wait for the in-cluster ControlPlaneRevision 'asm-managed' to reach Reconciled=True before deploying workloads (the fleet membership state can lag).
+6. CRDs: Install the GRPCRoute CRD from the kubernetes-sigs gateway-api repository (v1.1.0) and verify the Gateway API CRDs (Gateway, HTTPRoute, GRPCRoute) are available.
+7. Mesh Workload Manifests:
+    - Create Namespace 'csm-demo-v2-basic' labeled istio-injection=enabled.
+    - Deploy a sample HTTP server (whereami: us-docker.pkg.dev/google-samples/containers/gke/whereami:v1, port 8080) and a curl client (curlimages/curl), both with Envoy sidecars auto-injected. Restart/roll workloads after labeling so sidecars are injected.
+    - Create a Service for the server and an HTTPRoute whose parentRefs point at that Service (GAMMA east-west routing).
+    - Enforce strict mTLS by creating a PeerAuthentication (security.istio.io/v1beta1, mode STRICT), namespace-scoped in csm-demo-v2-basic.
+8. Edge Ingress (north-south, self-signed demo cert):
+    - Generate a self-signed cert/key and store it in a Kubernetes TLS Secret.
+    - Create a Gateway (gatewayClassName gke-l7-global-external-managed) with an HTTPS listener on port 443, tls mode Terminate referencing the Secret, using the reserved static IP.
+    - Create an HTTPRoute with parentRefs to that Gateway, routing public traffic to the server Service.
+    - NOTE (deferred): OIDC JWT auth, Cloud Armor WAF, and Cloud CDN are out of scope for this basic script.
+9. Validate that the HTTPRoutes are Accepted and the edge Gateway is Programmed with an assigned external IP (check status.conditions).
+10. Exec into the server pod and verify the Envoy sidecar (istio-proxy) container is present and running.
+11. Validation (mesh mTLS): From the curl client pod, request the server via the in-cluster Service and confirm success; then confirm mTLS is enforced (a request from a non-injected pod / plaintext is rejected under STRICT).
+12. Validation (edge): curl -k against the Gateway's external IP over HTTPS and confirm a successful response through the full edge-to-mesh path.
+
+If a command fails during execution, troubleshoot the error by checking IAM permissions or resource readiness before retrying.
+
+Also generate a clean-up-basic.sh script with steps to remove everything, including the reserved static IP, Cloud Armor policy, and Fleet membership.
