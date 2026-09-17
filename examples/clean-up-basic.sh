@@ -21,9 +21,42 @@ echo "🧹 Cleaning up CSM v2 demo"
 echo "Project: $PROJECT_ID / Region: $REGION"
 echo "=========================================="
 
-# 1. Kubernetes resources (best-effort; needs cluster credentials)
-echo "[1] Deleting Kubernetes resources..."
+# 1. Delete Gateways/HTTPRoutes FIRST and wait for the load balancer to tear
+#    down — BEFORE deleting the cluster.
+#
+# Deleting the cluster while the GKE gateway controller is still garbage-
+# collecting its load-balancer resources (forwarding rules, target proxies,
+# URL map, backend services, SSL certs, and — with frontend mTLS — the auto-
+# created ServerTlsPolicy + Certificate Manager TrustConfig) orphans them:
+# they keep billing and there is no controller left to remove them. Removing
+# the Gateway while the control plane is still alive lets the controller clean
+# them up on its own. This is a no-op when no edge Gateway was deployed.
+echo "[1] Deleting Gateways/Routes and waiting for the load balancer to tear down..."
 gcloud container clusters get-credentials "$CLUSTER_NAME" --region="$REGION" >/dev/null 2>&1
+if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+    kubectl delete httproute --all -n "$NAMESPACE" --ignore-not-found
+    kubectl delete gateway --all -n "$NAMESPACE" --ignore-not-found
+    echo "  Waiting for gateway-managed LB resources to be released (up to ~5m)..."
+    for i in $(seq 1 30); do
+        LEFT=$(
+            gcloud compute forwarding-rules list --global --filter="name~gkegw1" --format="value(name)" 2>/dev/null
+            gcloud compute target-https-proxies list --filter="name~gkegw1" --format="value(name)" 2>/dev/null
+            gcloud compute target-http-proxies list --filter="name~gkegw1" --format="value(name)" 2>/dev/null
+            gcloud compute url-maps list --filter="name~gkegw1" --format="value(name)" 2>/dev/null
+            gcloud compute backend-services list --global --filter="name~gkegw1" --format="value(name)" 2>/dev/null
+            gcloud compute ssl-certificates list --filter="name~gkegw1" --format="value(name)" 2>/dev/null
+        )
+        if [ -z "$(echo "$LEFT" | tr -d '[:space:]')" ]; then
+            echo "  Gateway load balancer resources released."
+            break
+        fi
+        [ "$i" = "30" ] && echo "  Warning: some LB resources still present after timeout; continuing anyway."
+        sleep 10
+    done
+fi
+
+# Now the rest of the Kubernetes resources.
+echo "  Deleting namespace and probe pod..."
 kubectl delete pod mtls-probe -n default --ignore-not-found
 kubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=false
 
